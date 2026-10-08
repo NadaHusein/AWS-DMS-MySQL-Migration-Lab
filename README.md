@@ -1,68 +1,120 @@
-# AWS DMS MySQL Migration Lab
+# AWS DMS: MySQL to Amazon RDS Migration Lab
 
-## Migrating a Local MySQL Database to Amazon RDS using AWS Database Migration Service
+## 📌 Project Overview
 
-### 1. Project Objective
+This lab demonstrates how to migrate a MySQL database running locally on a Windows machine to **Amazon RDS for MySQL** using **AWS Database Migration Service (AWS DMS)**.
 
-The objective of this lab was to simulate an on-premises MySQL environment and migrate the database to Amazon RDS using AWS Database Migration Service (AWS DMS).
+The local MySQL environment was used to **simulate an on-premises source database**.
 
-The source database was hosted locally on a Windows laptop, while AWS DMS and the target database were hosted in AWS.
+The migration was configured as:
 
-The migration design was intended to support:
+> **Full Load + Change Data Capture (CDC)**
 
-* Full Load migration
-* Change Data Capture (CDC)
-* MySQL → MySQL migration
-* Secure connectivity without exposing MySQL port 3306 directly to the public Internet
+This means AWS DMS first migrated the existing database contents and then continued replicating changes made to the source database.
 
 ---
 
-## 2. Architecture
+## 🎯 Lab Objectives
+
+The objectives of this lab were to:
+
+* Simulate an on-premises MySQL source environment.
+* Configure MySQL for AWS DMS.
+* Enable binary logging and CDC.
+* Establish secure connectivity between the local database and AWS.
+* Create an Amazon RDS for MySQL target database.
+* Configure AWS DMS source and target endpoints.
+* Perform a Full Load migration.
+* Enable ongoing CDC replication.
+* Verify that changes made to the source database are replicated.
+* Document the troubleshooting process and final architecture.
+
+---
+
+## 🏗️ Architecture
 
 ```text
-                    AWS
-┌──────────────────────────────────────────────────────┐
-│                                                      │
-│  AWS DMS                                             │
-│  shop-dms-replication                                │
-│  172.31.27.19                                        │
-│        │                                             │
-│        │ TCP 3306                                    │
-│        ▼                                             │
-│  EC2 Bridge / Proxy                                  │
-│  dms-vpn-bridge                                      │
-│  172.31.5.179                                        │
-│        │                                             │
-└────────┼─────────────────────────────────────────────┘
-         │
-         │ Tailscale
-         ▼
 ┌──────────────────────────────┐
-│ Local Windows Laptop         │
-│ Tailscale: 100.97.250.23     │
-│ LAN: 192.168.1.101           │
+│       Windows Laptop         │
 │                              │
-│ MySQL 8.0                    │
-│ Database: shop               │
-│ Port: 3306                   │
+│   MySQL 8.0                  │
+│   Database: shop             │
+│                              │
+│   customers                  │
+│   products                   │
+│   orders                     │
+└──────────────┬───────────────┘
+               │
+               │ Tailscale
+               │
+               ▼
+┌──────────────────────────────┐
+│        EC2 Bridge            │
+│                              │
+│   Amazon Linux 2023          │
+│   t3.micro                   │
+│                              │
+│   socat TCP Proxy            │
+│   Port 3306                  │
+└──────────────┬───────────────┘
+               │
+               │ Private VPC
+               ▼
+┌──────────────────────────────┐
+│          AWS DMS             │
+│                              │
+│ shop-dms-replication         │
+│ DMS t3.medium                │
+│                              │
+│ Full Load + CDC              │
+└──────────────┬───────────────┘
+               │
+               │ Private VPC
+               ▼
+┌──────────────────────────────┐
+│       Amazon RDS             │
+│                              │
+│   MySQL                      │
+│   shop-dms-target            │
+│   db.t3.micro                │
 └──────────────────────────────┘
 ```
 
-The EC2 instance acts as a TCP bridge/proxy between AWS DMS and the local MySQL database.
+### Connectivity Design
+
+The source MySQL database was not directly exposed to the public internet.
+
+The laptop was behind a CGNAT connection, so inbound connectivity from AWS to the laptop was not practical.
+
+Instead, Tailscale provided connectivity between the laptop and an EC2 bridge instance.
+
+The EC2 instance used `socat` as a TCP proxy:
+
+```text
+DMS
+ ↓
+EC2 private IP:3306
+ ↓
+socat
+ ↓
+Tailscale IP:3306
+ ↓
+Local Windows MySQL
+```
 
 ---
 
-# 3. Source Database
+# 🗄️ Source Database
 
-MySQL 8.0 was installed locally on Windows.
+## MySQL Environment
 
-Database:
+* Platform: Windows
+* MySQL: 8.0
+* Database: `shop`
 
-```text
-shop
-```
+### Tables
 
-Tables:
+The database contains three tables:
 
 ```text
 customers
@@ -70,489 +122,293 @@ products
 orders
 ```
 
-Initial data:
+### Customers
 
-| Table     | Rows |
-| --------- | ---: |
-| customers |    5 |
-| products  |    5 |
-| orders    |    6 |
+```text
+customer_id
+name
+email
+created_at
+```
 
-The source data was verified using SQL queries before starting the migration.
+### Products
+
+```text
+product_id
+name
+price
+stock
+```
+
+### Orders
+
+```text
+order_id
+customer_id
+product_id
+quantity
+order_date
+```
+
+Foreign keys were configured between `orders`, `customers`, and `products`.
 
 ---
 
-# 4. MySQL CDC Configuration
+# 🔄 CDC Configuration
 
-The source MySQL instance was checked for AWS DMS CDC requirements.
+AWS DMS CDC requires MySQL binary logging.
 
 The following settings were verified:
 
-```text
-log_bin = ON
-binlog_format = ROW
-binlog_row_image = FULL
+```sql
+SHOW GLOBAL VARIABLES LIKE 'log_bin';
+SHOW GLOBAL VARIABLES LIKE 'binlog_format';
+SHOW GLOBAL VARIABLES LIKE 'binlog_row_image';
 ```
 
-These settings are appropriate for MySQL binary-log based Change Data Capture.
+The final values were:
+
+```text
+log_bin          ON
+binlog_format    ROW
+binlog_row_image FULL
+```
+
+MySQL network timeout values were also increased globally to support the migration:
+
+```sql
+SET GLOBAL net_read_timeout = 300;
+SET GLOBAL net_write_timeout = 300;
+```
 
 ---
 
-# 5. Initial Connectivity Approach
+# 👤 DMS Source User
 
-The first approach was to allow AWS DMS to connect directly to the laptop's private LAN address:
+A dedicated MySQL user was created for AWS DMS rather than using the local root account.
 
-```text
-192.168.1.101:3306
+Example privileges:
+
+```sql
+CREATE USER 'dms_user'@'%' IDENTIFIED BY '<password>';
+
+GRANT REPLICATION SLAVE,
+      REPLICATION CLIENT,
+      RELOAD
+ON *.*
+TO 'dms_user'@'%';
+
+GRANT SELECT,
+      SHOW VIEW,
+      EVENT,
+      TRIGGER
+ON shop.*
+TO 'dms_user'@'%';
 ```
 
-However, the laptop was behind a home router using CGNAT.
-
-The router WAN address was in the:
-
-```text
-100.64.0.0/10
-```
-
-CGNAT address range.
-
-Therefore, traditional Internet port forwarding could not provide a reliable inbound path from AWS to the laptop.
-
-Exposing MySQL directly to the public Internet was also intentionally avoided.
+The password is intentionally not stored in this repository.
 
 ---
 
-# 6. Tailscale-Based Connectivity
+# ☁️ AWS Resources
 
-Tailscale was selected to provide connectivity between the AWS bridge instance and the local laptop without requiring a public inbound connection to the home network.
+## Amazon RDS
 
-Tailscale devices:
-
-```text
-EC2:
-100.79.148.113
-
-Windows laptop:
-100.97.250.23
-```
-
-The laptop advertised the local subnet:
+Target database:
 
 ```text
-192.168.1.0/24
+Identifier: shop-dms-target
+Engine: MySQL
+Instance class: db.t3.micro
+Region: eu-north-1
+Multi-AZ: No
+Public access: No
 ```
 
-The route was approved in the Tailscale administration console.
-
-IP forwarding was enabled on the EC2 instance and Windows laptop.
-
-The EC2 instance also accepted the advertised route.
+The RDS instance was kept private inside the VPC.
 
 ---
 
-# 7. AWS VPC Routing
+## AWS DMS
 
-The AWS route table was configured with:
+Replication instance:
 
 ```text
-Destination:
-192.168.1.0/24
-
-Target:
-EC2 bridge ENI
+Identifier: shop-dms-replication
+Class: dms.t3.medium
+Region: eu-north-1
+Multi-AZ: No
+Publicly accessible: No
 ```
 
-The EC2 instance had Source/Destination Check disabled because it was being used as a network bridge.
+### Source Endpoint
 
-The DMS subnet therefore had a route toward the local LAN through the EC2 bridge.
+```text
+Identifier: shop-mysql-source
+Engine: MySQL
+Server: EC2 private IP
+Port: 3306
+SSL: None
+```
+
+The endpoint connects to the EC2 bridge, which forwards the traffic to the local MySQL instance through Tailscale.
+
+### Target Endpoint
+
+```text
+Identifier: shop-mysql-target
+Engine: MySQL
+Server: RDS endpoint
+Port: 3306
+SSL: None
+```
+
+Both DMS endpoint connection tests completed successfully.
 
 ---
 
-# 8. First Major Troubleshooting Challenge
+# 🚀 Migration Task
 
-The first AWS DMS source endpoint connection test failed with:
+The migration task was configured as:
 
 ```text
-Can't connect to MySQL server on '192.168.1.101' (110)
+Task: shop-mysql-migration
 
-dial tcp 192.168.1.101:3306:
-i/o timeout
+Migration type:
+Full Load + CDC
+
+Table mapping:
+shop.*
+
+Target table preparation:
+Drop tables on target
+
+LOB mode:
+Do not include LOB columns
+
+Data validation:
+Enabled
+
+CloudWatch logs:
+Enabled
 ```
-
-This indicated a network-level connectivity problem rather than a MySQL authentication problem.
 
 ---
 
-# 9. Packet-Level Investigation
+# ✅ Migration Result
 
-`tcpdump` was used on the EC2 bridge.
+The AWS DMS task successfully completed the initial Full Load.
 
-Traffic from the DMS replication instance was observed:
+Final task status:
 
 ```text
-172.31.27.19 → 192.168.1.101:3306
+Load completed, replication ongoing
 ```
 
-Repeated TCP SYN packets were observed.
+Migration results:
 
-However, no SYN-ACK response was returned.
+```text
+Tables loaded:    3
+Tables errored:   0
+Tables queued:    0
+```
 
-This proved that:
+The three source tables were successfully migrated:
 
-* DMS traffic reached the EC2 instance.
-* The AWS route was being used.
-* The problem was occurring further along the path.
+```text
+customers
+products
+orders
+```
+
+After the Full Load completed, the task remained in:
+
+```text
+replication ongoing
+```
+
+This confirmed that DMS had transitioned to the CDC phase.
 
 ---
 
-# 10. Testing Tailscale Connectivity
+# 🔥 CDC Verification
 
-Tailscale connectivity between EC2 and Windows was verified.
-
-The EC2 instance successfully connected to the laptop's Tailscale IP:
-
-```text
-100.97.250.23:3306
-```
+To verify CDC, a new record was inserted into the source MySQL database **after the Full Load had already completed**.
 
 Example:
 
-```text
-Ncat: Connected to 100.97.250.23:3306.
-```
-
-This proved that:
-
-```text
-EC2 → Tailscale → Windows → MySQL
-```
-
-worked successfully.
-
-However, forwarded DMS traffic still failed to reach Windows.
-
-Windows `pktmon` did not show the DMS packets arriving on port 3306.
-
----
-
-# 11. Decision: Use EC2 as a TCP Proxy
-
-Instead of continuing to troubleshoot subnet-router forwarding, the architecture was simplified.
-
-EC2 was configured as a TCP proxy using `socat`.
-
-The resulting path became:
-
-```text
-DMS
- │
- │ 172.31.5.179:3306
- ▼
-EC2
- │
- │ socat
- ▼
-100.97.250.23:3306
- │
- ▼
-Local MySQL
-```
-
-This removed the requirement for DMS to directly route to the home LAN.
-
-DMS only needs normal AWS VPC connectivity to the EC2 instance.
-
----
-
-# 12. Security Group Configuration
-
-The EC2 security group allows MySQL traffic on port 3306 from the DMS security group.
-
-Conceptually:
-
-```text
-TCP 3306
-Source:
-shop-dms-sg
-```
-
-This avoids allowing MySQL traffic from the entire Internet.
-
-SSH access was temporarily opened during troubleshooting and should be restricted or removed after the lab.
-
----
-
-# 13. Second Major Troubleshooting Challenge
-
-After switching the DMS endpoint to:
-
-```text
-172.31.5.179:3306
-```
-
-the DMS connection initially returned:
-
-```text
-connection refused
-```
-
-This occurred because the `socat` process was running in the EC2 terminal.
-
-When the terminal/session ended, the foreground `socat` process stopped.
-
-The solution was to run `socat` as a persistent systemd service.
-
----
-
-# 14. Third Major Troubleshooting Challenge — MySQL Host Authorization
-
-Once `socat` was running, DMS successfully reached MySQL.
-
-The error changed to:
-
-```text
-Host 'ip-172-31-5-179.tail7e6d47.ts.net.'
-is not allowed to connect to this MySQL server
-```
-
-This was an important milestone because it proved that the network connection was now working.
-
-The failure had moved from the networking layer to the MySQL authorization layer.
-
----
-
-# 15. MySQL User Investigation
-
-The existing MySQL users were checked:
-
 ```sql
-SELECT user, host FROM mysql.user;
+USE shop;
+
+INSERT INTO customers (name, email)
+VALUES ('CDC Test', 'cdc-test@example.com');
 ```
 
-The result showed:
+The new record was subsequently reflected in the DMS migration statistics.
+
+This demonstrated that the change made after the initial migration was processed by the ongoing DMS replication task.
+
+### CDC Proof
+
+The project evidence includes a screenshot showing:
+
+* DMS task status
+* Full Load + CDC mode
+* Completed table migration
+* CDC activity after the source change
+
+Therefore, the lab demonstrates both:
 
 ```text
-root | localhost
+Full Load
+    +
+Change Data Capture
 ```
 
-Therefore, the `root` account was only configured for local connections.
+---
 
-The DMS connection was coming through the EC2/Tailscale path and was therefore not matching:
+# 🧩 Challenges & Solutions
+
+## 1. Local MySQL Was Not Directly Reachable from AWS
+
+### Problem
+
+The MySQL database was running on a Windows laptop behind a residential internet connection.
+
+The connection was using CGNAT, so traditional router port forwarding could not provide a reliable inbound path from AWS to the laptop.
+
+Initial DMS connectivity attempts to the laptop's local IP resulted in:
 
 ```text
-root@localhost
+dial tcp 192.168.1.101:3306: i/o timeout
 ```
+
+### Solution
+
+Tailscale was introduced to provide private connectivity between the Windows laptop and AWS.
+
+An EC2 instance was used as a bridge between AWS DMS and the Tailscale network.
 
 ---
 
-# 16. Dedicated DMS User
+## 2. Tailscale Subnet Routing Was More Complicated Than Necessary
 
-Instead of modifying the root account, a dedicated migration user was created:
+### Problem
 
-```sql
-CREATE USER 'dms_user'@'%'
-IDENTIFIED BY 'DmsLab@2026!';
-```
+An initial approach attempted to expose the laptop's local subnet through Tailscale subnet routing.
 
-Global privileges required for the migration/CDC configuration were granted separately from database-level privileges.
+This introduced additional routing complexity.
 
-Database-level permissions were granted specifically for:
+### Solution
 
-```text
-shop.*
-```
+The design was simplified.
 
-This follows the principle of using a dedicated migration account rather than using the MySQL root account.
-
----
-
-# 17. Final Successful Connectivity Test
-
-The DMS source endpoint was configured with:
-
-```text
-Server:
-172.31.5.179
-
-Port:
-3306
-
-Username:
-dms_user
-
-SSL:
-none
-```
-
-The AWS DMS endpoint connection test then returned:
-
-```text
-Successful
-```
-
-This confirmed the complete connectivity chain:
-
-```text
-AWS DMS
-   │
-   ▼
-EC2 172.31.5.179
-   │
-   ▼
-socat TCP proxy
-   │
-   ▼
-Tailscale
-   │
-   ▼
-Windows 100.97.250.23
-   │
-   ▼
-MySQL 8.0
-```
-
----
-
-# 18. Key Troubleshooting Lessons
-
-### Lesson 1 — Separate network failures from authentication failures
-
-The error:
-
-```text
-i/o timeout
-```
-
-indicated a connectivity/routing problem.
-
-Later:
-
-```text
-Host is not allowed to connect
-```
-
-proved that network connectivity had been established and the problem had moved to MySQL authorization.
-
----
-
-### Lesson 2 — Test each network layer independently
-
-Useful tests included:
-
-```bash
-nc -zv 100.97.250.23 3306
-```
-
-and:
-
-```bash
-nc -zv 172.31.5.179 3306
-```
-
-These tests verified TCP reachability without requiring MySQL authentication.
-
----
-
-### Lesson 3 — Packet capture can identify where traffic stops
-
-`tcpdump` showed the DMS SYN packets reaching EC2.
-
-`pktmon` on Windows showed that the packets were not reaching the Windows host.
-
-This narrowed the problem to the forwarding path.
-
----
-
-### Lesson 4 — CGNAT changes the connectivity design
-
-A local machine behind CGNAT cannot reliably be treated as an Internet-accessible server using ordinary port forwarding.
-
-A VPN/overlay network or another outbound connectivity mechanism is required.
-
----
-
-### Lesson 5 — Use dedicated database users
-
-Using:
-
-```text
-root
-```
-
-for a migration is unnecessary.
-
-A dedicated DMS account provides a cleaner security boundary and makes troubleshooting easier.
-
----
-
-# 19. Final Migration Plan
-
-The remaining migration steps are:
-
-1. Create the target Amazon RDS MySQL database.
-2. Create the DMS target endpoint.
-3. Test the target endpoint.
-4. Create a DMS migration task.
-5. Run Full Load.
-6. Verify the migrated tables and rows.
-7. Test CDC by inserting/updating/deleting source data.
-8. Verify the changes appear on RDS.
-9. Capture final evidence/screenshots.
-10. Remove paid AWS resources after the lab.
-
----
-
-# 20. Evidence to Capture
-
-Recommended evidence:
-
-* Local MySQL database and tables
-* Source row counts
-* MySQL CDC configuration
-* EC2 bridge configuration
-* Tailscale connected devices
-* AWS VPC route
-* DMS replication instance
-* Successful source endpoint connection
-* Target RDS database
-* Successful migration task
-* Migrated row counts
-* Successful CDC test
-
----
-
-# 21. Final Outcome
-
-The lab successfully established connectivity between a locally hosted MySQL database and AWS DMS despite the source environment being behind CGNAT.
+Instead of routing the entire `192.168.1.0/24` network, the EC2 instance became a dedicated TCP proxy.
 
 The final design used:
 
-* MySQL 8.0
-* AWS DMS
-* Amazon EC2
-* Tailscale
-* `socat`
-* AWS VPC routing
-* Security Groups
-* MySQL binary logging
-* Dedicated DMS database credentials
-
-The project also demonstrated practical troubleshooting across multiple layers:
-
 ```text
-Application
-    ↓
-Database authentication
-    ↓
-TCP connectivity
-    ↓
-Tailscale
-    ↓
-EC2 forwarding/proxy
-    ↓
-AWS VPC routing
-    ↓
-Security Groups
+EC2 → socat → Tailscale IP → MySQL
 ```
 
-This makes the lab more representative of a real infrastructure troubleshooting scenario than a simple click-through DMS migration.
+This reduced t
