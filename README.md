@@ -102,6 +102,10 @@ Tailscale IP:3306
 Local Windows MySQL
 ```
 
+The Tailscale admin console shows both nodes (the Windows laptop and the EC2 bridge) connected to the same tailnet:
+
+![Tailscale machines](screenshots/tailscale.png)
+
 ---
 
 # 🗄️ Source Database
@@ -151,6 +155,20 @@ order_date
 ```
 
 Foreign keys were configured between `orders`, `customers`, and `products`.
+
+### Creating the Database and Tables
+
+![Creating the shop database and tables](screenshots/DB/2.png)
+
+### Loading the Sample Data
+
+![Inserting sample data into the source tables](screenshots/DB/1.png)
+
+### Verifying the Source Data
+
+The source tables were queried to confirm the initial data set (5 customers, 5 products, 6 orders):
+
+![Source table contents](screenshots/DB/3.png)
 
 ---
 
@@ -305,6 +323,8 @@ Final task status:
 Load completed, replication ongoing
 ```
 
+![DMS task summary](screenshots/DMS/1-tasks.png)
+
 Migration results:
 
 ```text
@@ -320,6 +340,8 @@ customers
 products
 orders
 ```
+
+![DMS table statistics after Full Load](screenshots/DMS/2-table-statistics.png)
 
 After the Full Load completed, the task remained in:
 
@@ -344,7 +366,11 @@ INSERT INTO customers (name, email)
 VALUES ('CDC Test', 'cdc-test@example.com');
 ```
 
-The new record was subsequently reflected in the DMS migration statistics.
+![Inserting the CDC test row in the source database](screenshots/CDC/1-source.png)
+
+The new record was subsequently reflected in the DMS migration statistics (`customers` increased from 5 to 6 rows).
+
+![DMS table statistics after the CDC insert](screenshots/CDC/2-table-statistics-after-adding-a-row-on-customer-table.png)
 
 This demonstrated that the change made after the initial migration was processed by the ongoing DMS replication task.
 
@@ -398,6 +424,10 @@ An EC2 instance was used as a bridge between AWS DMS and the Tailscale network.
 An initial approach attempted to expose the laptop's local subnet through Tailscale subnet routing.
 
 This introduced additional routing complexity.
+
+The route was working at this stage: the EC2 instance accepted the advertised routes and could reach the laptop's LAN IP on port 3306.
+
+![Tailscale subnet routing test from EC2](screenshots/connection.png)
 
 ### Solution
 
@@ -581,22 +611,33 @@ Key security measures included:
 
 # 📸 Project Evidence
 
-Recommended screenshots for this repository:
+Screenshots used in this repository:
 
 ```text
 screenshots/
-├── 01-source-database.png
-├── 02-dms-task-full-load-cdc.png
-├── 03-dms-table-statistics.png
-├── 04-cdc-proof.png
-└── 05-architecture.png
+├── tailscale.png
+├── connection.png
+├── DB/
+│   ├── 1.png
+│   ├── 2.png
+│   └── 3.png
+├── DMS/
+│   ├── 1-tasks.png
+│   └── 2-table-statistics.png
+└── CDC/
+    ├── 1-source.png
+    └── 2-table-statistics-after-adding-a-row-on-customer-table.png
 ```
 
 ### Evidence 01 — Source Database
 
-Shows the original MySQL `shop` database and its tables/data.
+Shows the original MySQL `shop` database and its tables/data (`screenshots/DB/`).
 
 ### Evidence 02 — DMS Task
+
+`screenshots/DMS/1-tasks.png`
+
+Shows:
 
 Shows:
 
@@ -609,6 +650,8 @@ Full load, CDC
 
 ### Evidence 03 — Table Statistics
 
+`screenshots/DMS/2-table-statistics.png`
+
 Shows successful migration of:
 
 ```text
@@ -619,11 +662,9 @@ orders
 
 ### Evidence 04 — CDC
 
+`screenshots/CDC/`
+
 Shows the source change and corresponding DMS CDC activity.
-
-### Evidence 05 — Architecture
-
-Shows the final migration architecture and network path.
 
 ---
 
